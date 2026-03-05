@@ -1,5 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
+import { createServer as createHttpServer } from "http";
+import { Server } from "socket.io";
 import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -211,7 +213,23 @@ seedData();
 
 async function startServer() {
   const app = express();
+  const httpServer = createHttpServer(app);
+  const io = new Server(httpServer, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    }
+  });
+
   app.use(express.json());
+
+  // Socket.io connection handling
+  io.on("connection", (socket) => {
+    console.log("Client connected:", socket.id);
+    socket.on("disconnect", () => {
+      console.log("Client disconnected:", socket.id);
+    });
+  });
 
   // API Routes
   app.get("/api/destajistas", (req, res) => {
@@ -224,6 +242,7 @@ async function startServer() {
     const normalizedNombre = nombre.trim().toUpperCase();
     try {
       const info = db.prepare("INSERT INTO destajistas (nombre) VALUES (?)").run(normalizedNombre);
+      io.emit("data_changed", { type: "destajistas" });
       res.json({ id: info.lastInsertRowid });
     } catch (e) {
       res.status(400).json({ error: "El destajista ya existe" });
@@ -235,6 +254,7 @@ async function startServer() {
     const normalizedNombre = nombre.trim().toUpperCase();
     try {
       db.prepare("UPDATE destajistas SET nombre = ? WHERE id = ?").run(normalizedNombre, req.params.id);
+      io.emit("data_changed", { type: "destajistas" });
       res.json({ success: true });
     } catch (e) {
       res.status(400).json({ error: "Error al actualizar el destajista" });
@@ -253,6 +273,7 @@ async function startServer() {
       });
       
       transaction();
+      io.emit("data_changed", { type: "destajistas" });
       res.json({ success: true });
     } catch (e) {
       console.error("Error deleting destajista:", e);
@@ -270,6 +291,7 @@ async function startServer() {
     const normalizedNombre = nombre.trim().toUpperCase();
     try {
       const info = db.prepare("INSERT INTO actividades (nombre, precio) VALUES (?, ?)").run(normalizedNombre, precio);
+      io.emit("data_changed", { type: "actividades" });
       res.json({ id: info.lastInsertRowid });
     } catch (e) {
       res.status(400).json({ error: "La actividad ya existe" });
@@ -281,6 +303,7 @@ async function startServer() {
     const normalizedNombre = nombre.trim().toUpperCase();
     try {
       db.prepare("UPDATE actividades SET nombre = ?, precio = ? WHERE id = ?").run(normalizedNombre, precio, req.params.id);
+      io.emit("data_changed", { type: "actividades" });
       res.json({ success: true });
     } catch (e) {
       res.status(400).json({ error: "Error al actualizar la actividad" });
@@ -299,6 +322,7 @@ async function startServer() {
       });
       
       transaction();
+      io.emit("data_changed", { type: "actividades" });
       res.json({ success: true });
     } catch (e) {
       console.error("Error deleting actividad:", e);
@@ -312,10 +336,25 @@ async function startServer() {
   });
 
   app.post("/api/ubicaciones", (req, res) => {
-    const { paquete, manzana, lote } = req.body;
+    const data = req.body;
     try {
-      const info = db.prepare("INSERT INTO ubicaciones (paquete, manzana, lote) VALUES (?, ?, ?)").run(paquete, manzana, lote);
-      res.json({ id: info.lastInsertRowid });
+      const insert = db.prepare("INSERT OR IGNORE INTO ubicaciones (paquete, manzana, lote) VALUES (?, ?, ?)");
+      
+      if (Array.isArray(data)) {
+        const transaction = db.transaction((items) => {
+          for (const item of items) {
+            insert.run(item.paquete, item.manzana, item.lote);
+          }
+        });
+        transaction(data);
+        io.emit("data_changed", { type: "ubicaciones" });
+        res.json({ success: true, count: data.length });
+      } else {
+        const { paquete, manzana, lote } = data;
+        const info = insert.run(paquete, manzana, lote);
+        io.emit("data_changed", { type: "ubicaciones" });
+        res.json({ id: info.lastInsertRowid });
+      }
     } catch (e: any) {
       res.status(400).json({ error: e.message });
     }
@@ -323,6 +362,7 @@ async function startServer() {
 
   app.delete("/api/ubicaciones/:id", (req, res) => {
     db.prepare("DELETE FROM ubicaciones WHERE id = ?").run(req.params.id);
+    io.emit("data_changed", { type: "ubicaciones" });
     res.json({ success: true });
   });
 
@@ -355,6 +395,25 @@ async function startServer() {
     const data = req.body;
     
     try {
+      const checkDuplicate = (destajista_id: number, actividad_id: number, paquete: string, manzana: string, lotes: string) => {
+        const existing = db.prepare(`
+          SELECT lotes FROM capturas 
+          WHERE destajista_id = ? AND actividad_id = ? AND paquete = ? AND manzana = ?
+        `).all(destajista_id, actividad_id, paquete, manzana) as { lotes: string }[];
+
+        const newLotes = lotes.split(',').map(l => l.trim()).filter(l => l !== "");
+        
+        for (const row of existing) {
+          const existingLotes = row.lotes.split(',').map(l => l.trim()).filter(l => l !== "");
+          for (const nl of newLotes) {
+            if (existingLotes.includes(nl)) {
+              return nl;
+            }
+          }
+        }
+        return null;
+      };
+
       const insert = db.prepare(`
         INSERT INTO capturas (destajista_id, actividad_id, paquete, manzana, lotes, semana, cantidad)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -363,6 +422,18 @@ async function startServer() {
       if (Array.isArray(data)) {
         const transaction = db.transaction((items) => {
           for (const item of items) {
+            const duplicateLote = checkDuplicate(
+              item.destajista_id, 
+              item.actividad_id, 
+              item.paquete, 
+              item.manzana, 
+              item.lotes
+            );
+
+            if (duplicateLote) {
+              throw new Error(`El lote ${duplicateLote} ya fue pagado para esta actividad a este destajista.`);
+            }
+
             insert.run(
               item.destajista_id, 
               item.actividad_id, 
@@ -375,20 +446,29 @@ async function startServer() {
           }
         });
         transaction(data);
+        io.emit("data_changed", { type: "capturas" });
         res.json({ success: true, count: data.length });
       } else {
         const { destajista_id, actividad_id, paquete, manzana, lotes, semana, cantidad } = data;
+        
+        const duplicateLote = checkDuplicate(destajista_id, actividad_id, paquete, manzana, lotes);
+        if (duplicateLote) {
+          return res.status(400).json({ error: `El lote ${duplicateLote} ya fue pagado para esta actividad a este destajista.` });
+        }
+
         const info = insert.run(destajista_id, actividad_id, paquete, manzana, lotes, semana, cantidad);
+        io.emit("data_changed", { type: "capturas" });
         res.json({ id: info.lastInsertRowid });
       }
     } catch (error: any) {
       console.error("Error saving captures:", error);
-      res.status(500).json({ error: error.message });
+      res.status(400).json({ error: error.message });
     }
   });
 
   app.delete("/api/capturas/:id", (req, res) => {
     db.prepare("DELETE FROM capturas WHERE id = ?").run(req.params.id);
+    io.emit("data_changed", { type: "capturas" });
     res.json({ success: true });
   });
 
@@ -407,7 +487,7 @@ async function startServer() {
   }
 
   const PORT = 3000;
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }

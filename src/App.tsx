@@ -13,12 +13,15 @@ import {
   FileSpreadsheet,
   AlertCircle,
   Sun,
-  Moon
+  Moon,
+  ArrowLeft
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { generateWeeklySummary } from './services/geminiService';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { io } from 'socket.io-client';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -108,6 +111,46 @@ export default function App() {
   const [exportSemana, setExportSemana] = useState('1');
   const [exportDestajista, setExportDestajista] = useState('');
   const [previewData, setPreviewData] = useState<Captura[]>([]);
+  const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+
+  // Socket.io connection
+  useEffect(() => {
+    const socket = io(window.location.origin);
+
+    socket.on('connect', () => {
+      console.log('Connected to real-time server');
+    });
+
+    socket.on('data_changed', (data) => {
+      console.log('Data changed:', data.type);
+      // Refresh data based on what changed
+      if (data.type === 'destajistas' || data.type === 'actividades' || data.type === 'ubicaciones') {
+        fetchInitialData();
+      }
+      
+      if (data.type === 'capturas') {
+        // Refresh captures if we are in a view that shows them
+        if (currentView === 'summary-destajista' && filterDestajista) {
+          fetchCapturas({ destajista_id: filterDestajista });
+        } else if (currentView === 'summary-weekly' && filterSemana) {
+          fetchCapturas({ semana: filterSemana });
+        } else if (currentView === 'delete-captures') {
+          fetchCapturas({ semana: filterSemana, destajista_id: filterDestajista });
+        } else if (currentView === 'export') {
+          // Re-trigger the export preview fetch
+          const url = exportDestajista 
+            ? `/api/capturas?semana=${exportSemana}&destajista_id=${exportDestajista}`
+            : `/api/capturas?semana=${exportSemana}`;
+          fetch(url).then(res => res.json()).then(data => setPreviewData(data));
+        }
+      }
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [currentView, filterDestajista, filterSemana, exportSemana, exportDestajista]);
 
   const weeks = Array.from({ length: 52 }, (_, i) => (i + 1).toString());
 
@@ -193,17 +236,27 @@ export default function App() {
 
   const handleSaveUbicacion = async (e: React.FormEvent) => {
     e.preventDefault();
+    const lotes = newUbicacion.lote.split(',').map(l => l.trim()).filter(l => l !== '');
+    
+    const payload = lotes.map(l => ({
+      paquete: newUbicacion.paquete,
+      manzana: newUbicacion.manzana,
+      lote: l
+    }));
+
     const res = await fetch('/api/ubicaciones', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newUbicacion)
+      body: JSON.stringify(payload)
     });
+    
     if (res.ok) {
       setNewUbicacion({ paquete: '', manzana: '', lote: '' });
+      showNotification('Ubicaciones agregadas con éxito');
       fetchInitialData();
     } else {
       const data = await res.json();
-      alert(data.error || 'Error al guardar ubicación');
+      showNotification(data.error || 'Error al guardar ubicación', 'error');
     }
   };
 
@@ -418,6 +471,12 @@ export default function App() {
     const actividad = actividades.find(a => a.id === parseInt(currentActivity.actividad_id));
     if (!actividad) return;
 
+    // Check if activity is already in the list
+    if (addedActivities.some(a => a.actividad_id === currentActivity.actividad_id)) {
+      showNotification('Esta actividad ya está en la lista', 'error');
+      return;
+    }
+
     setAddedActivities([...addedActivities, {
       actividad_id: currentActivity.actividad_id,
       cantidad: currentActivity.cantidad,
@@ -451,23 +510,187 @@ export default function App() {
     }
   };
 
-  const exportToExcel = (data: Captura[], filename: string) => {
-    const worksheetData = data.map(c => ({
-      'Paquete': c.paquete,
-      'Manzana': c.manzana,
-      'Lotes': c.lotes,
-      'Actividad': c.actividad_nombre,
-      'Cantidad': c.cantidad,
-      'Precio': c.precio,
-      'Importe': c.cantidad * c.precio,
-      'Destajista': c.destajista_nombre,
-      'Semana': c.semana
-    }));
+  const exportToExcel = async (data: Captura[], filename: string) => {
+    const workbook = new ExcelJS.Workbook();
 
-    const worksheet = XLSX.utils.json_to_sheet(worksheetData);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Reporte");
-    XLSX.writeFile(workbook, `${filename}.xlsx`);
+    // Group data by destajista
+    const groupedData: Record<string, Captura[]> = data.reduce((acc, curr) => {
+      if (!acc[curr.destajista_nombre]) {
+        acc[curr.destajista_nombre] = [];
+      }
+      acc[curr.destajista_nombre].push(curr);
+      return acc;
+    }, {} as Record<string, Captura[]>);
+
+    for (const [destajistaName, workerData] of Object.entries(groupedData)) {
+      // Create sheet name: first and second name/surname, max 31 chars, clean invalid chars
+      let sheetName = destajistaName
+        .split(' ')
+        .filter(part => part.trim().length > 0)
+        .slice(0, 2)
+        .join(' ')
+        .replace(/[\\\/*?:\[\]]/g, '')
+        .substring(0, 31);
+      
+      if (!sheetName) sheetName = 'Reporte';
+
+      const worksheet = workbook.addWorksheet(sheetName);
+      const semana = workerData.length > 0 ? workerData[0].semana : 'N/A';
+
+      // Row 1: Header
+      worksheet.mergeCells('A1:F1');
+      const destajistaCell = worksheet.getCell('A1');
+      destajistaCell.value = `DESTAJISTA: ${destajistaName.toUpperCase()}`;
+      destajistaCell.font = { bold: true, size: 12 };
+      destajistaCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFF4B084' } // Orange
+      };
+      destajistaCell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      destajistaCell.alignment = { vertical: 'middle', horizontal: 'left' };
+
+      const semanaLabelCell = worksheet.getCell('G1');
+      semanaLabelCell.value = 'SEMANA:';
+      semanaLabelCell.font = { bold: true };
+      semanaLabelCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFF4B084' }
+      };
+      semanaLabelCell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      semanaLabelCell.alignment = { vertical: 'middle', horizontal: 'center' };
+
+      const semanaValueCell = worksheet.getCell('H1');
+      semanaValueCell.value = semana;
+      semanaValueCell.font = { bold: true };
+      semanaValueCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFF4B084' }
+      };
+      semanaValueCell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      semanaValueCell.alignment = { vertical: 'middle', horizontal: 'center' };
+
+      // Row 3: Table Headers
+      const headers = ['PAQUETE', 'MZA', 'LOTE', 'ACTIVIDAD', 'CANTIDAD', 'PRECIO', 'TOTAL', 'SUMATORIA INFOTOOLS'];
+      const headerRow = worksheet.getRow(3);
+      headers.forEach((h, i) => {
+        const cell = headerRow.getCell(i + 1);
+        cell.value = h;
+        cell.font = { bold: true };
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FFC6E0B4' } // Green
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      });
+
+      // Data Rows
+      let totalImporte = 0;
+      workerData.forEach((c, index) => {
+        const rowNum = index + 4;
+        const row = worksheet.getRow(rowNum);
+        const importe = c.cantidad * c.precio;
+        totalImporte += importe;
+
+        row.getCell(1).value = c.paquete;
+        row.getCell(2).value = c.manzana;
+        row.getCell(3).value = c.lotes;
+        row.getCell(4).value = c.actividad_nombre;
+        row.getCell(5).value = c.cantidad;
+        row.getCell(6).value = c.precio;
+        row.getCell(7).value = importe;
+        row.getCell(8).value = ''; // SUMATORIA INFOTOOLS
+
+        for (let i = 1; i <= 8; i++) {
+          row.getCell(i).border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+          if (i === 5 || i === 6 || i === 7) {
+            row.getCell(i).alignment = { horizontal: 'right' };
+          } else {
+            row.getCell(i).alignment = { horizontal: 'center' };
+          }
+        }
+      });
+
+      // Total Row
+      const lastDataRow = workerData.length + 4;
+      const totalCell = worksheet.getCell(`G${lastDataRow}`);
+      totalCell.value = totalImporte;
+      totalCell.font = { bold: true };
+      totalCell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFFFFF00' } // Yellow
+      };
+      totalCell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      };
+      totalCell.alignment = { horizontal: 'right' };
+
+      // Column widths
+      worksheet.getColumn(1).width = 12; // PAQUETE
+      worksheet.getColumn(2).width = 8;  // MZA
+      worksheet.getColumn(3).width = 15; // LOTE
+      worksheet.getColumn(4).width = 45; // ACTIVIDAD
+      worksheet.getColumn(5).width = 12; // CANTIDAD
+      worksheet.getColumn(6).width = 12; // PRECIO
+      worksheet.getColumn(7).width = 15; // TOTAL
+      worksheet.getColumn(8).width = 25; // SUMATORIA INFOTOOLS
+    }
+
+    // Generate buffer and download
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${filename}.xlsx`;
+    anchor.click();
+    window.URL.revokeObjectURL(url);
+  };
+
+  const handleGenerateAiSummary = async () => {
+    if (capturas.length === 0) return;
+    setAiLoading(true);
+    try {
+      const summary = await generateWeeklySummary(capturas, filterSemana);
+      setAiSummary(summary || 'No se pudo generar el resumen.');
+    } catch (error) {
+      showNotification('Error al generar resumen con IA', 'error');
+    } finally {
+      setAiLoading(false);
+    }
   };
 
   const renderDashboard = () => (
@@ -519,14 +742,15 @@ export default function App() {
 
     return (
       <div className="max-w-4xl mx-auto p-6">
-        <div className="flex items-center justify-between mb-6">
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Nueva Captura</h2>
+        <div className="flex items-center gap-4 mb-6">
           <button 
             onClick={() => setCurrentView('dashboard')}
-            className="px-4 py-2 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 rounded-xl hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors flex items-center gap-2"
+            className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center"
+            title="Volver"
           >
-            <LayoutDashboard size={18} /> Volver
+            <ArrowLeft size={20} />
           </button>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Nueva Captura</h2>
         </div>
         
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -727,14 +951,15 @@ export default function App() {
   const renderManageData = () => {
     return (
       <div className="p-6 space-y-8 max-w-5xl mx-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Configuración de Datos Maestros</h2>
+        <div className="flex items-center gap-4 mb-4">
           <button 
             onClick={() => setCurrentView('dashboard')}
-            className="px-4 py-2 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 rounded-xl hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors flex items-center gap-2"
+            className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center"
+            title="Volver"
           >
-            <LayoutDashboard size={18} /> Volver al Inicio
+            <ArrowLeft size={20} />
           </button>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Configuración de Datos Maestros</h2>
         </div>
 
         <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-gray-100 dark:border-zinc-800 p-8">
@@ -904,14 +1129,15 @@ export default function App() {
 
   const renderDeleteCaptures = () => (
     <div className="p-6 space-y-6 max-w-6xl mx-auto">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-2xl font-bold text-red-600 dark:text-red-400">Eliminar Capturas Erróneas</h2>
+      <div className="flex items-center gap-4 mb-4">
         <button 
           onClick={() => setCurrentView('dashboard')}
-          className="px-4 py-2 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 rounded-xl hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors flex items-center gap-2"
+          className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center"
+          title="Volver"
         >
-          <LayoutDashboard size={18} /> Volver al Inicio
+          <ArrowLeft size={20} />
         </button>
+        <h2 className="text-2xl font-bold text-red-600 dark:text-red-400">Eliminar Capturas Erróneas</h2>
       </div>
 
       <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-gray-100 dark:border-zinc-800 p-6">
@@ -987,14 +1213,15 @@ export default function App() {
 
     return (
       <div className="p-6 space-y-6 max-w-6xl mx-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Resumen por Destajista</h2>
+        <div className="flex items-center gap-4 mb-4">
           <button 
             onClick={() => setCurrentView('dashboard')}
-            className="px-4 py-2 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 rounded-xl hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors flex items-center gap-2"
+            className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center"
+            title="Volver"
           >
-            <LayoutDashboard size={18} /> Volver
+            <ArrowLeft size={20} />
           </button>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Resumen por Destajista</h2>
         </div>
         <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-gray-100 dark:border-zinc-800 p-6">
           <h2 className="text-lg font-semibold mb-4 dark:text-white">Seleccionar Destajista</h2>
@@ -1092,30 +1319,82 @@ export default function App() {
 
     return (
       <div className="p-6 space-y-6 max-w-6xl mx-auto">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Resumen Semanal</h2>
+        <div className="flex items-center gap-4 mb-4">
           <button 
             onClick={() => setCurrentView('dashboard')}
-            className="px-4 py-2 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 rounded-xl hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors flex items-center gap-2"
+            className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center"
+            title="Volver"
           >
-            <LayoutDashboard size={18} /> Volver
+            <ArrowLeft size={20} />
           </button>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Resumen Semanal</h2>
         </div>
         <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-gray-100 dark:border-zinc-800 p-6">
-          <h2 className="text-lg font-semibold mb-4 dark:text-white">Filtrar por Semana</h2>
-          <div className="flex gap-4">
-            <select 
-              className="flex-1 max-w-xs p-3 bg-gray-50 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none dark:text-white"
-              value={filterSemana}
-              onChange={e => setFilterSemana(e.target.value)}
-            >
-              {weeks.map(w => <option key={w} value={w}>Semana {w}</option>)}
-            </select>
-            <button className="px-6 py-3 bg-blue-600 text-white font-semibold rounded-xl hover:bg-blue-700 transition-colors">
-              Buscar
-            </button>
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex-1">
+              <h2 className="text-lg font-semibold mb-4 dark:text-white">Filtrar por Semana</h2>
+              <div className="flex gap-4">
+                <select 
+                  className="flex-1 max-w-xs p-3 bg-gray-50 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none dark:text-white"
+                  value={filterSemana}
+                  onChange={e => {
+                    setFilterSemana(e.target.value);
+                    setAiSummary(null);
+                  }}
+                >
+                  {weeks.map(w => <option key={w} value={w}>Semana {w}</option>)}
+                </select>
+                <button className="px-6 py-3 bg-blue-600 text-white font-semibold rounded-xl hover:bg-blue-700 transition-colors">
+                  Buscar
+                </button>
+              </div>
+            </div>
+            
+            {capturas.length > 0 && (
+              <button 
+                onClick={handleGenerateAiSummary}
+                disabled={aiLoading}
+                className="flex items-center justify-center gap-2 px-6 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-semibold rounded-xl hover:from-purple-700 hover:to-indigo-700 transition-all shadow-md disabled:opacity-50"
+              >
+                {aiLoading ? (
+                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <Sun size={20} className="text-yellow-300" />
+                )}
+                {aiLoading ? 'Generando...' : 'Resumen con IA'}
+              </button>
+            )}
           </div>
         </div>
+
+        <AnimatePresence>
+          {aiSummary && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800/50 rounded-2xl p-6 relative overflow-hidden"
+            >
+              <div className="absolute top-0 right-0 p-4 opacity-10">
+                <Sun size={80} className="text-indigo-600 dark:text-indigo-400" />
+              </div>
+              <div className="relative z-10">
+                <h3 className="text-indigo-900 dark:text-indigo-300 font-bold flex items-center gap-2 mb-3">
+                  <Sun size={18} className="text-yellow-500" /> Análisis Inteligente (Gemini Flash)
+                </h3>
+                <div className="text-indigo-800 dark:text-indigo-200 text-sm leading-relaxed whitespace-pre-wrap">
+                  {aiSummary}
+                </div>
+                <button 
+                  onClick={() => setAiSummary(null)}
+                  className="mt-4 text-xs text-indigo-600 dark:text-indigo-400 hover:underline font-medium"
+                >
+                  Cerrar resumen
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {Object.entries(grouped).map(([nombre, data]) => (
           <div key={nombre} className="bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-gray-100 dark:border-zinc-800 overflow-hidden">
@@ -1176,17 +1455,18 @@ export default function App() {
 
     return (
       <div className="p-6 max-w-6xl mx-auto space-y-8">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4 mb-4">
+          <button 
+            onClick={() => setCurrentView('dashboard')}
+            className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-all shadow-md flex items-center justify-center"
+            title="Volver"
+          >
+            <ArrowLeft size={20} />
+          </button>
           <div>
             <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Exportar Reportes</h2>
             <p className="text-gray-500 dark:text-zinc-400">Genera archivos Excel de las capturas realizadas</p>
           </div>
-          <button 
-            onClick={() => setCurrentView('dashboard')}
-            className="px-4 py-2 bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-zinc-400 rounded-xl hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors flex items-center gap-2"
-          >
-            <LayoutDashboard size={18} /> Volver
-          </button>
         </div>
 
         <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-gray-100 dark:border-zinc-800 p-8">
