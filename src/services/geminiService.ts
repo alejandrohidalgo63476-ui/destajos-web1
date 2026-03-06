@@ -1,14 +1,16 @@
 import { GoogleGenAI } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+
+if (!apiKey) {
+  console.warn("VITE_GEMINI_API_KEY no está configurada");
+}
+
+const ai = new GoogleGenAI({ apiKey });
 
 export async function generateWeeklySummary(capturas: any[], semana: string) {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY no está configurada");
-  }
+  const model = "gemini-2.0-flash";
 
-  const model = "gemini-3-flash-preview";
-  
   const prompt = `
     Analiza los siguientes datos de capturas de destajos para la Semana ${semana} y genera un resumen ejecutivo breve (máximo 150 palabras).
     Incluye:
@@ -18,23 +20,20 @@ export async function generateWeeklySummary(capturas: any[], semana: string) {
     4. Una recomendación u observación rápida.
 
     Datos:
-    ${JSON.stringify(capturas.map(c => ({
-      destajista: c.destajista_nombre,
-      actividad: c.actividad_nombre,
-      cantidad: c.cantidad,
-      importe: c.cantidad * c.precio
-    })))}
+    ${JSON.stringify(
+      capturas.map(c => ({
+        destajista: c.destajista_nombre,
+        actividad: c.actividad_nombre,
+        cantidad: c.cantidad,
+        importe: c.cantidad * c.precio
+      }))
+    )}
   `;
 
-  try {
-    const response = await ai.models.generateContent({
-      model: model,
-      contents: [{ parts: [{ text: prompt }] }],
-    });
+  const response = await ai.models.generateContent({
+    model,
+    contents: [{ parts: [{ text: prompt }] }],
+  });
 
-    return response.text;
-  } catch (error) {
-    console.error("Error generating AI summary:", error);
-    throw error;
-  }
+  return response.text;
 }
